@@ -11,10 +11,16 @@ import android.transition.ChangeTransform;
 import android.transition.Fade;
 import android.transition.TransitionSet;
 import android.view.View;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import com.maksymov.randomgallery.R;
+import com.maksymov.randomgallery.base.RandomGalleryTasks;
+import com.maksymov.randomgallery.base.Status;
+import com.maksymov.randomgallery.base.TaskListener;
+import com.maksymov.randomgallery.base.TaskManagerFragment;
+import com.maksymov.randomgallery.base.TaskResultsFragment;
 import com.maksymov.randomgallery.screens.Router;
 import com.maksymov.randomgallery.screens.details.DetailsFragment;
 import com.maksymov.randomgallery.screens.gallery.GalleryFragment;
@@ -22,14 +28,24 @@ import com.maksymov.randomgallery.screens.sync.ActionsHandlerService;
 import com.maksymov.randomgallery.screens.sync.SyncService;
 import com.maksymov.randomgallery.screens.sync.SyncState;
 
-public class MainActivity extends AppCompatActivity implements SyncState.Listener, Router {
+public class MainActivity
+        extends AppCompatActivity
+        implements Router {
 
     private App app;
 
     private TextView messageTextView;
-    private TextView progressTextView;
+    private ProgressBar syncProgressBar;
     private TextView actionTextView;
     private View messageContainer;
+
+    private TaskManagerFragment taskManagerFragment;
+    private TaskResultsFragment taskResultsFragment;
+
+    private RandomGalleryTasks tasks;
+
+    private boolean syncInProgress;
+    private boolean hasUpdates;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -38,96 +54,82 @@ public class MainActivity extends AppCompatActivity implements SyncState.Listene
 
         app = (App) getApplicationContext();
 
+        tasks = new RandomGalleryTasks(app.getGalleryClient());
+
         if (savedInstanceState == null) {
             // clean launch, no fragments
+            taskManagerFragment = new TaskManagerFragment();
+            taskResultsFragment = new TaskResultsFragment();
             getSupportFragmentManager()
                     .beginTransaction()
-                    .add(R.id.fragmentContainer,
-                            new GalleryFragment())
+                    .add(R.id.fragmentContainer, new GalleryFragment())
+                    .add(taskManagerFragment, TaskManagerFragment.TAG)
+                    .add(taskResultsFragment, TaskResultsFragment.TAG)
                     .commit();
+        } else {
+            taskManagerFragment =
+                    (TaskManagerFragment) getSupportFragmentManager()
+                            .findFragmentByTag(TaskManagerFragment.TAG);
+            taskResultsFragment =
+                    (TaskResultsFragment) getSupportFragmentManager()
+                            .findFragmentByTag(TaskResultsFragment.TAG);
         }
-
-        Intent checkForUpdatesIntent = new Intent(this,
-                ActionsHandlerService.class);
-        checkForUpdatesIntent.setAction(
-                ActionsHandlerService.ACTION_CHECK_FOR_UPDATES);
-        startService(checkForUpdatesIntent);
 
         actionTextView = findViewById(R.id.actionTextView);
         actionTextView.setOnClickListener(v -> {
-            SyncService.scheduleUpdate(this);
+            if (taskResultsFragment.syncSubject != null) {
+                taskResultsFragment.syncSubject
+                        .removeListener(syncListener);
+            }
+
+            taskResultsFragment.syncSubject = taskManagerFragment
+                    .submitTask(tasks.createSyncTask());
+            taskResultsFragment.syncSubject
+                    .addListener(syncListener);
         });
+
         messageTextView = findViewById(R.id.messageTextView);
         messageContainer = findViewById(R.id.messageContainer);
-        progressTextView = findViewById(R.id.progressTextView);
+        syncProgressBar = findViewById(R.id.syncProgressBar);
+
+        updateUi();
     }
 
     @Override
     protected void onStart() {
         super.onStart();
 
-        app.getSyncState().addListener(this);
+        if (taskResultsFragment.hasUpdatesSubject == null) {
+            taskResultsFragment.hasUpdatesSubject =
+                    taskManagerFragment
+                            .submitTask(tasks.createCheckUpdatesTask());
+        }
+
+        taskResultsFragment.hasUpdatesSubject
+                .addListener(hasUpdatesListener);
+
+        if (taskResultsFragment.syncSubject != null) {
+            taskResultsFragment.syncSubject
+                    .addListener(syncListener);
+        }
     }
 
     @Override
     protected void onStop() {
         super.onStop();
-        app.getSyncState().removeListener(this);
-    }
-
-    @Override
-    public void onSyncStateChanged(SyncState syncState) {
-        if (syncState.hasUpdates()
-                || syncState.isScheduled()
-                || syncState.isInProgress()) {
-
-            messageContainer.setVisibility(View.VISIBLE);
-            if (syncState.isInProgress()) {
-                messageTextView.setText(
-                        R.string.updating_gallery);
-                progressTextView.setVisibility(View.VISIBLE);
-                progressTextView.setText(
-                        getString(
-                                R.string.percentage,
-                                syncState.getProgressPercentage()));
-                actionTextView.setVisibility(View.INVISIBLE);
-            } else if (syncState.isScheduled()) {
-                messageTextView.setText(
-                        R.string.updating_scheduled);
-                progressTextView.setVisibility(View.INVISIBLE);
-                actionTextView.setVisibility(View.INVISIBLE);
-            } else {
-                messageTextView.setText(
-                        R.string.update_available);
-                progressTextView.setVisibility(View.INVISIBLE);
-                actionTextView.setVisibility(View.VISIBLE);
-            }
-        } else {
-            messageContainer.setVisibility(View.GONE);
+        taskResultsFragment.hasUpdatesSubject
+                .removeListener(hasUpdatesListener);
+        if (taskResultsFragment.syncSubject != null) {
+            taskResultsFragment.syncSubject
+                    .removeListener(syncListener);
         }
     }
 
     @Override
-    public void onSyncFinished() {
-        Toast.makeText(
-                this,
-                R.string.gallery_updated,
-                Toast.LENGTH_SHORT
-        ).show();
-    }
-
-    @Override
-    public void onSyncFailed() {
-        Toast.makeText(
-                this,
-                R.string.update_error,
-                Toast.LENGTH_SHORT
-        ).show();
-    }
-
-    @Override
-    public void launchDetails(View sharedView, String localPhotoId) {
-        Fragment fragment = DetailsFragment.newInstance(localPhotoId);
+    public void launchDetails(View sharedView,
+                              String localPhotoId) {
+        Fragment fragment = DetailsFragment
+                .newInstance(localPhotoId);
 
         // transition for shared image
         TransitionSet transitionSet = new TransitionSet()
@@ -146,8 +148,8 @@ public class MainActivity extends AppCompatActivity implements SyncState.Listene
 
         getSupportFragmentManager()
                 .beginTransaction()
-                .addSharedElement(sharedView,
-                        getString(R.string.shared_tag))
+                .addSharedElement(
+                        sharedView, getString(R.string.shared_tag))
                 .addToBackStack(null)
                 .replace(R.id.fragmentContainer, fragment)
                 .commit();
@@ -158,4 +160,41 @@ public class MainActivity extends AppCompatActivity implements SyncState.Listene
         onBackPressed();
     }
 
+    private void updateUi() {
+
+        if (syncInProgress) {
+            messageContainer.setVisibility(View.VISIBLE);
+            messageTextView.setText(R.string.updating_gallery);
+            syncProgressBar.setVisibility(View.VISIBLE);
+            actionTextView.setVisibility(View.INVISIBLE);
+
+        } else if (hasUpdates) {
+            messageContainer.setVisibility(View.VISIBLE);
+            messageTextView.setText(R.string.update_available);
+            syncProgressBar.setVisibility(View.INVISIBLE);
+            actionTextView.setVisibility(View.VISIBLE);
+
+        } else {
+            messageContainer.setVisibility(View.GONE);
+        }
+
+    }
+
+    private TaskListener<Boolean> hasUpdatesListener = res -> {
+        if (res.getStatus() == Status.SUCCESS) {
+            this.hasUpdates = res.getData();
+            updateUi();
+        }
+    };
+
+    private TaskListener<Boolean> syncListener = res -> {
+        this.syncInProgress = res.getStatus() ==
+                Status.IN_PROGRESS;
+        if (res.getStatus() == Status.SUCCESS && res.getData()) {
+            this.hasUpdates = false;
+        }
+        updateUi();
+    };
+
 }
+
